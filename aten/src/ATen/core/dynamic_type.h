@@ -125,6 +125,8 @@ class DynamicType : public Type {
   static const TypeKind Kind = TypeKind::DynamicType;
   static TORCH_API DynamicTypePtr create(Type& ty);
 
+  explicit DynamicType(Tag, Arguments);
+
  private:
   bool symmetric() const override {
     return false;
