@@ -2128,4 +2128,6 @@ private:
   std::string reason_;
 };
 
+TORCH_API bool containsAnyType(const TypePtr& type);
+
 } // namespace c10
