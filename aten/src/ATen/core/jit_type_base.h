@@ -47,7 +47,8 @@ namespace c10 {
   _(AnyListType)            \
   _(AnyTupleType)           \
   _(AnyClassType)           \
-  _(UnionType)
+  _(UnionType)              \
+  _(DynamicType)
 
 enum class TypeKind {
 #define DEFINE_TYPE(T) T,
@@ -67,6 +68,8 @@ using ConstTypePtr = std::shared_ptr<const Type>;
 using TypePrinter = std::function<c10::optional<std::string>(const Type&)>;
 
 struct TORCH_API Type : std::enable_shared_from_this<Type> {
+  friend TORCH_API bool operator==(const Type& lhs, const Type& rhs);
+
  private:
   TypeKind kind_;
 
@@ -76,10 +79,14 @@ struct TORCH_API Type : std::enable_shared_from_this<Type> {
   virtual std::string annotation_str_impl(TypePrinter printer) const {
     return str();
   }
+  // a == b
+  virtual bool equals(const Type& rhs) const = 0;
+  // a == b <=> b == a
+  virtual bool symmetric() const {
+    return true;
+  }
 
  public:
-  virtual bool operator==(const Type& rhs) const = 0;
-
   // subtyping relation. By default, we return true for the case
   // when the type is exactly equal or if this <: T where rhs = Optional[T]
 
@@ -238,6 +245,13 @@ struct TORCH_API Type : std::enable_shared_from_this<Type> {
         str());
   }
 };
+
+TORCH_API inline bool operator==(const Type& lhs, const Type& rhs) {
+  if (C10_UNLIKELY(!rhs.symmetric())) {
+    return rhs.equals(lhs);
+  }
+  return lhs.equals(rhs);
+}
 
 struct NamedType;
 using NamedTypePtr = std::shared_ptr<NamedType>;
