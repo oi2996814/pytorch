@@ -335,7 +335,7 @@ ModelCompatCheckResult is_compatible(
     result.errors.emplace_back(s.str());
   }
 
-  std::unordered_set<std::string> supported_type = runtime_info.supported_types;
+  const auto& supported_type = runtime_info.supported_types;
 
   // Check type table
   for (const auto& type_name : model_info.type_table) {
@@ -349,8 +349,7 @@ ModelCompatCheckResult is_compatible(
   }
 
   // Check operators
-  std::unordered_map<std::string, OperatorInfo> operator_info =
-      model_info.operator_info;
+  const auto& operator_info = model_info.operator_info;
   for (auto const& op : operator_info) {
     std::string op_name = op.first;
     OperatorInfo model_op_info = op.second;
