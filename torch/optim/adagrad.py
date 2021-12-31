@@ -1,6 +1,8 @@
 import torch
-from . import _functional as F
+from torch import Tensor
+
 from .optimizer import Optimizer
+from typing import List
 
 
 class Adagrad(Optimizer):
@@ -38,12 +40,14 @@ class Adagrad(Optimizer):
         weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
         eps (float, optional): term added to the denominator to improve
             numerical stability (default: 1e-10)
+        foreach (bool, optional): whether foreach implementation of optimizer is used (default: False)
 
     .. _Adaptive Subgradient Methods for Online Learning and Stochastic
         Optimization: http://jmlr.org/papers/v12/duchi11a.html
     """
 
-    def __init__(self, params, lr=1e-2, lr_decay=0, weight_decay=0, initial_accumulator_value=0, eps=1e-10):
+    def __init__(self, params, lr=1e-2, lr_decay=0, weight_decay=0, initial_accumulator_value=0,
+                 eps=1e-10, foreach=False):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
         if not 0.0 <= lr_decay:
@@ -56,7 +60,7 @@ class Adagrad(Optimizer):
             raise ValueError("Invalid epsilon value: {}".format(eps))
 
         defaults = dict(lr=lr, lr_decay=lr_decay, eps=eps, weight_decay=weight_decay,
-                        initial_accumulator_value=initial_accumulator_value)
+                        initial_accumulator_value=initial_accumulator_value, foreach=foreach)
         super(Adagrad, self).__init__(params, defaults)
 
         for group in self.param_groups:
@@ -82,6 +86,7 @@ class Adagrad(Optimizer):
                 and returns the loss.
         """
         loss = None
+
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
@@ -92,8 +97,11 @@ class Adagrad(Optimizer):
             state_sums = []
             state_steps = []
 
+            has_sparse_grad = False
             for p in group['params']:
                 if p.grad is not None:
+                    if p.grad.is_sparse:
+                        has_sparse_grad = True
                     params_with_grad.append(p)
                     grads.append(p.grad)
                     state = self.state[p]
@@ -103,13 +111,136 @@ class Adagrad(Optimizer):
                     # record the step after step update
                     state_steps.append(state['step'])
 
-            F.adagrad(params_with_grad,
-                      grads,
-                      state_sums,
-                      state_steps,
-                      lr=group['lr'],
-                      weight_decay=group['weight_decay'],
-                      lr_decay=group['lr_decay'],
-                      eps=group['eps'])
+            adagrad(params_with_grad,
+                    grads,
+                    state_sums,
+                    state_steps,
+                    lr=group['lr'],
+                    weight_decay=group['weight_decay'],
+                    lr_decay=group['lr_decay'],
+                    eps=group['eps'],
+                    has_sparse_grad=has_sparse_grad,
+                    foreach=group['foreach'])
 
         return loss
+
+
+def adagrad(params: List[Tensor],
+            grads: List[Tensor],
+            state_sums: List[Tensor],
+            state_steps: List[int],
+            *,
+            lr: float,
+            weight_decay: float,
+            lr_decay: float,
+            eps: float,
+            has_sparse_grad: bool,
+            foreach: bool):
+    r"""Functional API that performs Adagrad algorithm computation.
+
+    See :class:`~torch.optim.Adagrad` for details.
+    """
+
+    if foreach and not torch.jit.is_scripting() and (not has_sparse_grad):
+        func = _multi_tensor_adagrad
+    else:
+        func = _single_tensor_adagrad
+
+    func(params,
+         grads,
+         state_sums,
+         state_steps,
+         lr=lr,
+         weight_decay=weight_decay,
+         lr_decay=lr_decay,
+         eps=eps,
+         has_sparse_grad=has_sparse_grad)
+
+def _make_sparse(grad, grad_indices, values):
+    size = grad.size()
+    if grad_indices.numel() == 0 or values.numel() == 0:
+        return torch.empty_like(grad)
+    return torch.sparse_coo_tensor(grad_indices, values, size)
+
+
+def _single_tensor_adagrad(params: List[Tensor],
+                           grads: List[Tensor],
+                           state_sums: List[Tensor],
+                           state_steps: List[int],
+                           *,
+                           lr: float,
+                           weight_decay: float,
+                           lr_decay: float,
+                           eps: float,
+                           has_sparse_grad: bool):
+
+    for (param, grad, state_sum, step) in zip(params, grads, state_sums, state_steps):
+        if weight_decay != 0:
+            if grad.is_sparse:
+                raise RuntimeError("weight_decay option is not compatible with sparse gradients")
+            grad = grad.add(param, alpha=weight_decay)
+
+        clr = lr / (1 + (step - 1) * lr_decay)
+
+        if grad.is_sparse:
+            grad = grad.coalesce()  # the update is non-linear so indices must be unique
+            grad_indices = grad._indices()
+            grad_values = grad._values()
+
+            state_sum.add_(_make_sparse(grad, grad_indices, grad_values.pow(2)))
+            std = state_sum.sparse_mask(grad)
+            std_values = std._values().sqrt_().add_(eps)
+            param.add_(_make_sparse(grad, grad_indices, grad_values / std_values), alpha=-clr)
+        else:
+            is_complex = torch.is_complex(param)
+            if is_complex:
+                grad = torch.view_as_real(grad)
+                state_sum = torch.view_as_real(state_sum)
+                param = torch.view_as_real(param)
+            state_sum.addcmul_(grad, grad, value=1)
+            std = state_sum.sqrt().add_(eps)
+            param.addcdiv_(grad, std, value=-clr)
+            if is_complex:
+                param = torch.view_as_complex(param)
+                state_sum = torch.view_as_complex(state_sum)
+
+
+def _multi_tensor_adagrad(params: List[Tensor],
+                          grads: List[Tensor],
+                          state_sums: List[Tensor],
+                          state_steps: List[int],
+                          *,
+                          lr: float,
+                          weight_decay: float,
+                          lr_decay: float,
+                          eps: float,
+                          has_sparse_grad: bool):
+
+    if has_sparse_grad:
+        return _single_tensor_adagrad(params,
+                                      grads,
+                                      state_sums,
+                                      state_steps,
+                                      lr=lr,
+                                      weight_decay=weight_decay,
+                                      lr_decay=lr_decay,
+                                      eps=eps,
+                                      has_sparse_grad=has_sparse_grad)
+
+    if weight_decay != 0:
+        if has_sparse_grad:
+            raise RuntimeError(
+                "weight_decay option is not compatible with sparse gradients"
+            )
+        torch._foreach_add_(grads, params, alpha=weight_decay)
+
+    minus_clr = [-lr / (1 + (step - 1) * lr_decay) for step in state_steps]
+
+    grads = [torch.view_as_real(x) if torch.is_complex(x) else x for x in grads]
+    state_sums = [torch.view_as_real(x) if torch.is_complex(x) else x for x in state_sums]
+    torch._foreach_addcmul_(state_sums, grads, grads, value=1)
+    std = torch._foreach_add(torch._foreach_sqrt(state_sums), eps)
+    toAdd = torch._foreach_div(torch._foreach_mul(grads, minus_clr), std)
+    toAdd = [torch.view_as_complex(x) if torch.is_complex(params[i]) else x for i, x in enumerate(toAdd)]
+    torch._foreach_add_(params, toAdd)
+    state_sums = [torch.view_as_complex(x) if torch.is_complex(params[i]) else x for i, x in enumerate(state_sums)]
