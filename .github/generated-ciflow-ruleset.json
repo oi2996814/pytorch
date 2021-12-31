@@ -52,6 +52,20 @@
     "ciflow/bazel": [
       "linux-xenial-cuda11.3-py3.7-gcc7-bazel-test"
     ],
+    "ciflow/binaries": [
+      "linux-binary-conda",
+      "linux-binary-libtorch",
+      "linux-binary-manywheel"
+    ],
+    "ciflow/binaries/conda": [
+      "linux-binary-conda"
+    ],
+    "ciflow/binaries/libtorch": [
+      "linux-binary-libtorch"
+    ],
+    "ciflow/binaries/wheel": [
+      "linux-binary-manywheel"
+    ],
     "ciflow/cpu": [
       "caffe2-linux-xenial-py3.7-gcc5.4",
       "linux-bionic-py3.7-clang9",
