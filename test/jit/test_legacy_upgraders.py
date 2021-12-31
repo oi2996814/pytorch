@@ -5,16 +5,12 @@ import io
 import os
 import random
 import sys
-import hypothesis.strategies as st
-from hypothesis import example, settings, given
 
 import torch
-
 # Make the helper files in test/ importable
 pytorch_test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(pytorch_test_dir)
 from torch.testing._internal.jit_utils import JitTestCase
-from torch.jit.mobile import _load_for_lite_interpreter
 
 if __name__ == "__main__":
     raise RuntimeError(
@@ -23,7 +19,56 @@ if __name__ == "__main__":
         "instead."
     )
 
-class TestSaveLoadForOpVersion(JitTestCase):
+# Legacy test cases for dynamic operator versioning
+class TestLegacyUpgraders(JitTestCase):
+    def test_versioned_symbols(self):
+        """
+        Tests Torchscript symbol versioning. See note [Versioned Symbols].
+        This test uses an undocumented, test-only function
+        torch._test_serialization_subcmul.
+        This function is implemented as (a - alpha * b) with a default value
+        of 1 for alpha. In file format version 2, however, it was implemented
+        as (b - alpha * a) with a default value of 2 for alpha.
+        This test verifies a module seralized with file format version 2
+        exhibits the old behavior, and that the same module newly serialized
+        exhibits the current behavior.
+        """
+        class MyModule(torch.nn.Module):
+            def __init__(self):
+                super(MyModule, self).__init__()
+
+            def forward(self, a, b, alpha: float):
+                no_alpha = torch._test_serialization_subcmul(a, b)
+                with_alpha = torch._test_serialization_subcmul(a, b, alpha)
+                return no_alpha, with_alpha
+
+        def historic_subcmul(a, b, alpha=2):
+            return b - alpha * a
+
+        def current_subcmul(a, b, alpha=1):
+            return a - alpha * b
+
+        # Loads and verifies the historic behavior of the module
+        # that was serialized with version 2
+        module_v2 = torch.jit.load(pytorch_test_dir + "/jit/fixtures/_test_serialization_subcmul_v2.pt")
+        a = torch.randn((5,))
+        b = torch.randn((5,))
+        alpha = random.random()
+        args = (a, b, alpha)
+        no_alpha_v2, with_alpha_v2 = module_v2(*args)
+        self.assertEqual(no_alpha_v2, historic_subcmul(a, b))
+        self.assertEqual(with_alpha_v2, historic_subcmul(*args))
+
+        # Scripts, saves, loads and verifies the current behavior of the module
+        scripted_module = torch.jit.script(MyModule())
+        buffer = io.BytesIO()
+        torch.jit.save(scripted_module, buffer)
+        buffer.seek(0)
+        module_current = torch.jit.load(buffer)
+        no_alpha_current, with_alpha_current = module_current(*args)
+        self.assertEqual(no_alpha_current, current_subcmul(a, b))
+        self.assertEqual(with_alpha_current, current_subcmul(*args))
+
     # Helper that returns the module after saving and loading
     def _save_load_module(self, m):
         scripted_module = torch.jit.script(m())
@@ -31,12 +76,6 @@ class TestSaveLoadForOpVersion(JitTestCase):
         torch.jit.save(scripted_module, buffer)
         buffer.seek(0)
         return torch.jit.load(buffer)
-
-    def _save_load_mobile_module(self, m):
-        scripted_module = torch.jit.script(m())
-        buffer = io.BytesIO(scripted_module._save_to_buffer_for_lite_interpreter())
-        buffer.seek(0)
-        return _load_for_lite_interpreter(buffer)
 
     # Helper which returns the result of a function or the exception the
     #   function threw.
@@ -53,7 +92,6 @@ class TestSaveLoadForOpVersion(JitTestCase):
         node_count = sum(str(n).count(kind) for n in m.graph.nodes())
         self.assertEqual(node_count, count)
 
-
     """
     Tests that verify Torchscript remaps aten::div(_) from versions 0-3
     to call either aten::true_divide(_), if an input is a float type,
@@ -62,12 +100,7 @@ class TestSaveLoadForOpVersion(JitTestCase):
       div behavior has not yet been updated.
     """
 
-    @settings(max_examples=10, deadline=200000)  # A total of 10 examples will be generated
-    @given(
-        sample_input=st.tuples(st.integers(min_value=5, max_value=199), st.floats(min_value=5.0, max_value=199.0))
-    )  # Generate a pair (integer, float)
-    @example((2, 3, 2.0, 3.0))  # Ensure this example will be covered
-    def test_versioned_div_tensor(self, sample_input):
+    def test_versioned_div_tensor(self):
         def historic_div(self, other):
             if self.is_floating_point() or other.is_floating_point():
                 return self.true_divide(other)
@@ -87,14 +120,18 @@ class TestSaveLoadForOpVersion(JitTestCase):
 
         # Loads historic module
         try:
-            v3_mobile_module = _load_for_lite_interpreter(
-                pytorch_test_dir + "/cpp/jit/upgrader_models/test_versioned_div_tensor_v2.ptl")
+            v3_module = torch.jit.load(pytorch_test_dir + "/jit/fixtures/test_versioned_div_tensor_v3.pt")
         except Exception as e:
             self.skipTest("Failed to load fixture!")
 
-        current_mobile_module = self._save_load_mobile_module(MyModule)
+        self._verify_count("aten::div", v3_module, 6)  # true_divide and divide alias to div
+        self._verify_count('prim::Constant[value="trunc"]', v3_module, 1)  # rounding_mode argument
 
-        for val_a, val_b in product(sample_input, sample_input):
+        current_module = self._save_load_module(MyModule)
+        self._verify_count("aten::div", current_module, 3)
+
+        vals = (2., 3., 2, 3)
+        for val_a, val_b in product(vals, vals):
             a = torch.tensor((val_a,))
             b = torch.tensor((val_b,))
 
@@ -108,15 +145,10 @@ class TestSaveLoadForOpVersion(JitTestCase):
                     for result in m_results:
                         self.assertEqual(result, fn_result)
 
-            _helper(v3_mobile_module, historic_div)
-            _helper(current_mobile_module, torch.div)
+            _helper(v3_module, historic_div)
+            _helper(current_module, torch.div)
 
-    @settings(max_examples=10, deadline=200000)  # A total of 10 examples will be generated
-    @given(
-        sample_input=st.tuples(st.integers(min_value=5, max_value=199), st.floats(min_value=5.0, max_value=199.0))
-    )  # Generate a pair (integer, float)
-    @example((2, 3, 2.0, 3.0))  # Ensure this example will be covered
-    def test_versioned_div_tensor_inplace(self, sample_input):
+    def test_versioned_div_tensor_inplace(self):
         def historic_div_(self, other):
             if self.is_floating_point() or other.is_floating_point():
                 return self.true_divide_(other)
@@ -131,38 +163,38 @@ class TestSaveLoadForOpVersion(JitTestCase):
                 return a
 
         try:
-            v3_mobile_module = _load_for_lite_interpreter(
-                pytorch_test_dir + "/cpp/jit/upgrader_models/test_versioned_div_tensor_inplace_v2.ptl")
+            v3_module = torch.jit.load(pytorch_test_dir + "/jit/fixtures/test_versioned_div_tensor_inplace_v3.pt")
         except Exception as e:
             self.skipTest("Failed to load fixture!")
 
-        current_mobile_module = self._save_load_mobile_module(MyModule)
+        self._verify_count("aten::div", v3_module, 2)  # true_divide and divide both alias to div
+        self._verify_count('prim::Constant[value="trunc"]', v3_module, 1)  # rounding_mode argument
 
-        for val_a, val_b in product(sample_input, sample_input):
+        current_module = self._save_load_module(MyModule)
+        self._verify_count("aten::div", current_module, 1)
+
+        vals = (2., 3., 2, 3)
+        for val_a, val_b in product(vals, vals):
             a = torch.tensor((val_a,))
             b = torch.tensor((val_b,))
 
             def _helper(m, fn):
                 fn_result = self._try_fn(fn, a.clone(), b)
                 m_result = self._try_fn(m, a, b)
+
                 if isinstance(m_result, Exception):
                     self.assertTrue(fn_result, Exception)
                 else:
                     self.assertEqual(m_result, fn_result)
                     self.assertEqual(m_result, a)
 
-            _helper(v3_mobile_module, historic_div_)
+            _helper(v3_module, historic_div_)
 
             # Recreates a since it was modified in place
             a = torch.tensor((val_a,))
-            _helper(current_mobile_module, torch.Tensor.div_)
+            _helper(current_module, torch.Tensor.div_)
 
-    @settings(max_examples=10, deadline=200000)  # A total of 10 examples will be generated
-    @given(
-        sample_input=st.tuples(st.integers(min_value=5, max_value=199), st.floats(min_value=5.0, max_value=199.0))
-    )  # Generate a pair (integer, float)
-    @example((2, 3, 2.0, 3.0))  # Ensure this example will be covered
-    def test_versioned_div_tensor_out(self, sample_input):
+    def test_versioned_div_tensor_out(self):
         def historic_div_out(self, other, out):
             if self.is_floating_point() or other.is_floating_point() or out.is_floating_point():
                 return torch.true_divide(self, other, out=out)
@@ -176,14 +208,18 @@ class TestSaveLoadForOpVersion(JitTestCase):
                 return a.div(b, out=out)
 
         try:
-            v3_mobile_module = _load_for_lite_interpreter(
-                pytorch_test_dir + "/cpp/jit/upgrader_models/test_versioned_div_tensor_out_v2.ptl")
+            v3_module = torch.jit.load(pytorch_test_dir + "/jit/fixtures/test_versioned_div_tensor_out_v3.pt")
         except Exception as e:
             self.skipTest("Failed to load fixture!")
 
-        current_mobile_module = self._save_load_mobile_module(MyModule)
+        self._verify_count("aten::div", v3_module, 2)  # true_divide and divide alias to div
+        self._verify_count('prim::Constant[value="trunc"]', v3_module, 1)  # rounding_mode argument
 
-        for val_a, val_b in product(sample_input, sample_input):
+        current_module = self._save_load_module(MyModule)
+        self._verify_count("aten::div", current_module, 1)
+
+        vals = (2., 3., 2, 3)
+        for val_a, val_b in product(vals, vals):
             a = torch.tensor((val_a,))
             b = torch.tensor((val_b,))
 
@@ -202,15 +238,10 @@ class TestSaveLoadForOpVersion(JitTestCase):
                         self.assertEqual(m_result, fn_result)
                         self.assertEqual(m_result, out)
 
-                _helper(v3_mobile_module, historic_div_out)
-                _helper(current_mobile_module, torch.div)
+                _helper(v3_module, historic_div_out)
+                _helper(current_module, torch.div)
 
-    @settings(max_examples=10, deadline=200000)  # A total of 10 examples will be generated
-    @given(
-        sample_input=st.tuples(st.integers(min_value=5, max_value=199), st.floats(min_value=5.0, max_value=199.0))
-    )  # Generate a pair (integer, float)
-    @example((2, 3, 2.0, 3.0))  # Ensure this example will be covered
-    def test_versioned_div_scalar(self, sample_input):
+    def test_versioned_div_scalar(self):
         def historic_div_scalar_float(self, other: float):
             return torch.true_divide(self, other)
 
@@ -234,10 +265,8 @@ class TestSaveLoadForOpVersion(JitTestCase):
                 return a / b
 
         try:
-            v3_mobile_module_float = _load_for_lite_interpreter(
-                pytorch_test_dir + "/jit/fixtures/test_versioned_div_scalar_float_v2.ptl")
-            v3_mobile_module_int = _load_for_lite_interpreter(
-                pytorch_test_dir + "/cpp/jit/upgrader_models/test_versioned_div_scalar_int_v2.ptl")
+            v3_module_float = torch.jit.load(pytorch_test_dir + "/jit/fixtures/test_versioned_div_scalar_float_v3.pt")
+            v3_module_int = torch.jit.load(pytorch_test_dir + "/jit/fixtures/test_versioned_div_scalar_int_v3.pt")
         except Exception as e:
             self.skipTest("Failed to load fixture!")
 
@@ -245,10 +274,14 @@ class TestSaveLoadForOpVersion(JitTestCase):
             self._verify_count("aten::div", m, 2)  # true_divide and divide alias to div
             self._verify_count('prim::Constant[value="trunc"]', m, 1)  # rounding_mode argument
 
-        current_mobile_module_float = self._save_load_mobile_module(MyModuleFloat)
-        current_mobile_module_int = self._save_load_mobile_module(MyModuleInt)
+        current_module_float = self._save_load_module(MyModuleFloat)
+        current_module_int = self._save_load_module(MyModuleInt)
 
-        for val_a, val_b in product(sample_input, sample_input):
+        for m in (current_module_float, current_module_int):
+            self._verify_count("aten::div", m, 1)
+
+        vals = (2., 3., 2, 3)
+        for val_a, val_b in product(vals, vals):
             a = torch.tensor((val_a,))
             b = val_b
 
@@ -262,18 +295,13 @@ class TestSaveLoadForOpVersion(JitTestCase):
                     self.assertEqual(m_result, fn_result)
 
             if isinstance(b, float):
-                _helper(v3_mobile_module_float, current_mobile_module_float)
-                _helper(current_mobile_module_float, torch.div)
+                _helper(v3_module_float, historic_div_scalar_float)
+                _helper(current_module_float, torch.div)
             else:
-                _helper(v3_mobile_module_int, historic_div_scalar_int)
-                _helper(current_mobile_module_int, torch.div)
+                _helper(v3_module_int, historic_div_scalar_int)
+                _helper(current_module_int, torch.div)
 
-    @settings(max_examples=10, deadline=200000)  # A total of 10 examples will be generated
-    @given(
-        sample_input=st.tuples(st.integers(min_value=5, max_value=199), st.floats(min_value=5.0, max_value=199.0))
-    )  # Generate a pair (integer, float)
-    @example((2, 3, 2.0, 3.0))  # Ensure this example will be covered
-    def test_versioned_div_scalar_reciprocal(self, sample_input):
+    def test_versioned_div_scalar_reciprocal(self):
         def historic_div_scalar_float_reciprocal(self, other: float):
             return other / self
 
@@ -297,17 +325,24 @@ class TestSaveLoadForOpVersion(JitTestCase):
                 return b / a
 
         try:
-            v3_mobile_module_float = _load_for_lite_interpreter(
-                pytorch_test_dir + "/cpp/jit/upgrader_models/test_versioned_div_scalar_reciprocal_float_v2.ptl")
-            v3_mobile_module_int = _load_for_lite_interpreter(
-                pytorch_test_dir + "/cpp/jit/upgrader_models/test_versioned_div_scalar_reciprocal_int_v2.ptl")
+            v3_module_float = torch.jit.load(pytorch_test_dir + "/jit/fixtures/test_versioned_div_scalar_reciprocal_float_v3.pt")
+            v3_module_int = torch.jit.load(pytorch_test_dir + "/jit/fixtures/test_versioned_div_scalar_reciprocal_int_v3.pt")
         except Exception as e:
             self.skipTest("Failed to load fixture!")
 
-        current_mobile_module_float = self._save_load_mobile_module(MyModuleFloat)
-        current_mobile_module_int = self._save_load_mobile_module(MyModuleInt)
+        # NOTE: number / tensor is rewritten to torch.reciprocal(a) * b
+        #  so true_divide and floor_divide do not appear in their graphs
+        for m in (v3_module_float, v3_module_int):
+            self._verify_no("aten::div", m)
+            self._verify_no("aten::true_divide", m)
+            self._verify_no("aten::floor_divide", m)
+            self._verify_count("aten::reciprocal", m, 1)
 
-        for val_a, val_b in product(sample_input, sample_input):
+        current_module_float = self._save_load_module(MyModuleFloat)
+        current_module_int = self._save_load_module(MyModuleInt)
+
+        vals = (2., 3., 2, 3)
+        for val_a, val_b in product(vals, vals):
             a = torch.tensor((val_a,))
             b = val_b
 
@@ -330,18 +365,13 @@ class TestSaveLoadForOpVersion(JitTestCase):
                     pass
 
             if isinstance(b, float):
-                _helper(v3_mobile_module_float, current_mobile_module_float)
-                _helper(current_mobile_module_float, torch.div)
+                _helper(v3_module_float, historic_div_scalar_float_reciprocal)
+                _helper(current_module_float, torch.div)
             else:
-                _helper(v3_mobile_module_int, current_mobile_module_int)
-                _helper(current_mobile_module_int, torch.div)
+                _helper(v3_module_int, historic_div_scalar_int_reciprocal)
+                _helper(current_module_int, torch.div)
 
-    @settings(max_examples=10, deadline=200000)  # A total of 10 examples will be generated
-    @given(
-        sample_input=st.tuples(st.integers(min_value=5, max_value=199), st.floats(min_value=5.0, max_value=199.0))
-    )  # Generate a pair (integer, float)
-    @example((2, 3, 2.0, 3.0))  # Ensure this example will be covered
-    def test_versioned_div_scalar_inplace(self, sample_input):
+    def test_versioned_div_scalar_inplace(self):
         def historic_div_scalar_float_inplace(self, other: float):
             return self.true_divide_(other)
 
@@ -368,17 +398,26 @@ class TestSaveLoadForOpVersion(JitTestCase):
                 return a
 
         try:
-            v3_mobile_module_float = _load_for_lite_interpreter(
-                pytorch_test_dir + "/cpp/jit/upgrader_models/test_versioned_div_scalar_inplace_float_v2.ptl")
-            v3_mobile_module_int = _load_for_lite_interpreter(
-                pytorch_test_dir + "/cpp/jit/upgrader_models/test_versioned_div_scalar_inplace_int_v2.ptl")
+            v3_module_float = torch.jit.load(pytorch_test_dir + "/jit/fixtures/test_versioned_div_scalar_inplace_float_v3.pt")
+            v3_module_int = torch.jit.load(pytorch_test_dir + "/jit/fixtures/test_versioned_div_scalar_inplace_int_v3.pt")
         except Exception as e:
             self.skipTest("Failed to load fixture!")
 
-        current_mobile_module_float = self._save_load_module(MyModuleFloat)
-        current_mobile_module_int = self._save_load_module(MyModuleInt)
+        for m in (v3_module_float, v3_module_int):
+            self._verify_count("aten::div_", m, 2)  # true_divide and divide alias to div
+            self._verify_count('prim::Constant[value="trunc"]', m, 1)  # rounding_mode argument
 
-        for val_a, val_b in product(sample_input, sample_input):
+        current_module_float = self._save_load_module(MyModuleFloat)
+        current_module_int = self._save_load_module(MyModuleInt)
+
+        for m in (current_module_float, current_module_int):
+            self._verify_count("aten::div", m, 1)
+
+        for m in (current_module_float, current_module_int):
+            self._verify_count("aten::div", m, 1)
+
+        vals = (2., 3., 2, 3)
+        for val_a, val_b in product(vals, vals):
             a = torch.tensor((val_a,))
             b = val_b
 
@@ -392,9 +431,11 @@ class TestSaveLoadForOpVersion(JitTestCase):
                     self.assertEqual(m_result, fn_result)
 
             if isinstance(b, float):
-                _helper(current_mobile_module_float, torch.Tensor.div_)
+                _helper(v3_module_float, historic_div_scalar_float_inplace)
+                _helper(current_module_float, torch.Tensor.div_)
             else:
-                _helper(current_mobile_module_int, torch.Tensor.div_)
+                _helper(v3_module_int, historic_div_scalar_int_inplace)
+                _helper(current_module_int, torch.Tensor.div_)
 
     # NOTE: Scalar division was already true division in op version 3,
     #   so this test verifies the behavior is unchanged.
@@ -411,12 +452,14 @@ class TestSaveLoadForOpVersion(JitTestCase):
                 return (result_0, result_1, result_2, result_3)
 
         try:
-            v3_mobile_module = _load_for_lite_interpreter(
-                pytorch_test_dir + "/cpp/jit/upgrader_models/test_versioned_div_scalar_scalar_v2.ptl")
+            v3_module = torch.jit.load(pytorch_test_dir + "/jit/fixtures/test_versioned_div_scalar_scalar_v3.pt")
         except Exception as e:
             self.skipTest("Failed to load fixture!")
 
-        current_mobile_module = self._save_load_mobile_module(MyModule)
+        self._verify_count("aten::div", v3_module, 4)
+
+        current_module = self._save_load_module(MyModule)
+        self._verify_count("aten::div", current_module, 4)
 
         def _helper(m, fn):
             vals = (5., 3, 2., 7)
@@ -425,4 +468,73 @@ class TestSaveLoadForOpVersion(JitTestCase):
             for mr, hr in zip(m_result, fn_result):
                 self.assertEqual(mr, hr)
 
-        _helper(v3_mobile_module, current_mobile_module)
+        _helper(v3_module, current_module)
+
+    # NOTE: the JIT was incapable of handling boolean fill values when
+    #   PyTorch produced file format versions 0-4
+    def test_versioned_full_integer_value(self):
+        class MyModule(torch.nn.Module):
+            def __init__(self):
+                super(MyModule, self).__init__()
+
+            def forward(self, int_fill: int):
+                size = torch.Size(2, 2)
+                a = torch.full(size, int_fill)
+                b = torch.full(size, 1)
+                return (a, b)
+
+        try:
+            v4_module = torch.jit.load(pytorch_test_dir + "/jit/fixtures/test_versioned_full_integer_value_v4.pt")
+        except Exception as e:
+            self.skipTest("Failed to load fixture!")
+
+        self._verify_count("aten::full", v4_module, 2)
+
+        current_module = self._save_load_module(MyModule)
+        self._verify_count("aten::full", current_module, 2)
+
+        # Verifies historic integer type inference is float
+        # NOTE: only verifies floating point, not exact dtype, due to
+        #   https://github.com/pytorch/pytorch/issues/40470
+        results = v4_module(2)
+        for result in results:
+            self.assertTrue(result.is_floating_point())
+
+        # Verifies values are correct
+        a, b = results
+        self.assertTrue((a == 2.).all())
+        self.assertTrue((b == 1.).all())
+
+    # Tests that torch.full behavior which is the same from prior versions
+    #   to version 5 is preserved.
+    # NOTE: while torch.full in eager PyTorch accepts a requires_grad argument,
+    #   it does not in Torchscript (see https://github.com/pytorch/pytorch/issues/40363)
+    def test_versioned_full_preserved(self):
+        class MyModule(torch.nn.Module):
+            def __init__(self):
+                super(MyModule, self).__init__()
+
+            def forward(self, float_fill: float):
+                size = (2, 2)
+                a = torch.full(size, 1.)
+                b = torch.full(size, float_fill)
+                c = torch.full(size, float_fill, dtype=torch.long)
+
+                out = torch.empty(size, dtype=torch.long)
+                d = torch.full(size, float_fill, out=out)
+
+                e = torch.full(size, float_fill, dtype=torch.float16, pin_memory=None,
+                               layout=torch.strided, device='cpu')
+                return (a, b, c, d, e)
+
+        try:
+            v4_module = torch.jit.load(pytorch_test_dir + "/jit/fixtures/test_versioned_full_preserved_v4.pt")
+        except Exception as e:
+            self.skipTest("Failed to load fixture!")
+
+        self._verify_count("aten::full", v4_module, 5)
+
+        current_module = self._save_load_module(MyModule)
+        self._verify_count("aten::full", current_module, 5)
+
+        self.assertEqual(v4_module(2.), current_module(2.))
